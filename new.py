@@ -1,14 +1,18 @@
+
 import dash
 from dash import dcc, html
 from dash.dependencies import Input, Output
 import plotly.graph_objs as go
 import pandas as pd
 import yfinance as yf
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error
 import numpy as np
-from statsmodels.tsa.arima.model import ARIMA
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+import math
+from gnews import GNews
+from textblob import TextBlob
 
 
 # Load stock data
@@ -18,105 +22,129 @@ def load_data(ticker):
     return data
 
 
-# Feature engineering
-def create_features(data):
-    data['EMA_12'] = data['Close'].ewm(span=12, adjust=False).mean()
-    data['EMA_26'] = data['Close'].ewm(span=26, adjust=False).mean()
-    data['MACD'] = data['EMA_12'] - data['EMA_26']
-    data['RSI'] = calculate_rsi(data['Close'])
-    data['MA_50'] = data['Close'].rolling(window=50).mean()
-    data['MA_200'] = data['Close'].rolling(window=200).mean()
-    data['Return'] = data['Close'].pct_change()
-    data['Volatility'] = data['Return'].rolling(window=20).std() * np.sqrt(252)
-    return data
+# Preprocess data for LSTM
+def preprocess_data(data, look_back=60):
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(data[['Close']])
+    X, y = [], []
+    for i in range(look_back, len(scaled_data)):
+        X.append(scaled_data[i - look_back:i, 0])
+        y.append(scaled_data[i, 0])
+    X, y = np.array(X), np.array(y)
+    X = np.reshape(X, (X.shape[0], X.shape[1], 1))
+    return X, y, scaler
 
 
-# Calculate RSI
-def calculate_rsi(prices, period=14):
-    delta = prices.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+# Forecasting model using LSTM
+def forecast(data, days=30, look_back=60):
+    X, y, scaler = preprocess_data(data, look_back)
 
+    train_size = int(len(X) * 0.8)
+    X_train, X_test = X[:train_size], X[train_size:]
+    y_train, y_test = y[:train_size], y[train_size:]
 
-# Forecasting model with accuracy prediction
-def forecast_with_accuracy(data, days=30):
-    data = create_features(data)
-    data.dropna(inplace=True)
+    model = Sequential([
+        LSTM(units=50, return_sequences=True, input_shape=(look_back, 1)),
+        LSTM(units=50),
+        Dense(1)
+    ])
+    model.compile(optimizer='adam', loss='mean_squared_error')
+    model.fit(X_train, y_train, epochs=10, batch_size=32, validation_data=(X_test, y_test), verbose=0)
 
-    features = ['EMA_12', 'EMA_26', 'MACD', 'RSI', 'MA_50', 'MA_200', 'Volatility']
-    X = data[features]
-    y = data['Close']
+    train_predict = model.predict(X_train)
+    test_predict = model.predict(X_test)
+    train_rmse = math.sqrt(mean_squared_error(y_train, train_predict))
+    test_rmse = math.sqrt(mean_squared_error(y_test, test_predict))
+    accuracy = 1 - (test_rmse / np.mean(scaler.inverse_transform(y_test.reshape(-1, 1))))
 
-    tscv = TimeSeriesSplit(n_splits=5)
-    mae_scores = []
-    mse_scores = []
-    accuracy_scores = []
+    last_sequence = X[-1]
+    future_predictions = []
 
-    for train_index, test_index in tscv.split(X):
-        X_train, X_test = X.iloc[train_index], X.iloc[test_index]
-        y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+    for _ in range(days):
+        next_pred = model.predict(last_sequence.reshape(1, look_back, 1))[0]
+        future_predictions.append(next_pred[0])
+        last_sequence = np.roll(last_sequence, -1)
+        last_sequence[-1] = next_pred
 
-        # Random Forest model
-        rf_model = RandomForestRegressor(n_estimators=100, random_state=42)
-        rf_model.fit(X_train, y_train)
-        rf_predictions = rf_model.predict(X_test)
-
-        # ARIMA model
-        arima_model = ARIMA(y_train, order=(1, 1, 1))
-        arima_results = arima_model.fit()
-        arima_predictions = arima_results.forecast(steps=len(y_test))
-
-        # Ensemble predictions
-        predictions = (rf_predictions + arima_predictions) / 2
-
-        mae = mean_absolute_error(y_test, predictions)
-        mse = mean_squared_error(y_test, predictions)
-        mae_scores.append(mae)
-        mse_scores.append(mse)
-
-        accuracy = np.mean(np.abs((y_test - predictions) / y_test) <= 0.05)
-        accuracy_scores.append(accuracy)
-
-    # Final predictions
-    rf_model.fit(X, y)
-    last_data = X.iloc[-1].values.reshape(1, -1)
-    future_features = np.tile(last_data, (days, 1))
-    rf_future = rf_model.predict(future_features)
-
-    arima_model = ARIMA(y, order=(1, 1, 1))
-    arima_results = arima_model.fit()
-    arima_future = arima_results.forecast(steps=days)
-
-    future_predictions = (rf_future + arima_future) / 2
+    future_predictions = scaler.inverse_transform(np.array(future_predictions).reshape(-1, 1))
     future_days = pd.date_range(start=data['Date'].iloc[-1] + pd.Timedelta(days=1), periods=days)
 
-    return future_days, future_predictions, np.mean(mae_scores), np.mean(mse_scores), np.mean(accuracy_scores)
+    return future_days, future_predictions, accuracy
 
 
-# Initialize the Dash app
+# Get stock description
+def get_stock_description(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+
+        description = f"{info['longName']} ({ticker})\n\n"
+        description += f"Sector: {info.get('sector', 'N/A')}\n"
+        description += f"Industry: {info.get('industry', 'N/A')}\n"
+        description += f"Current Price: ${info.get('currentPrice', 'N/A')}\n"
+        description += f"52 Week High: ${info.get('fiftyTwoWeekHigh', 'N/A')}\n"
+        description += f"52 Week Low: ${info.get('fiftyTwoWeekLow', 'N/A')}\n"
+        description += f"\nBusiness Summary: {info.get('longBusinessSummary', 'N/A')}"
+
+        return description
+    except:
+        return f"Unable to fetch description for {ticker}. Please try again later."
+
+
+# Get latest news
+def get_latest_news(ticker):
+    google_news = GNews(language='en', country='US', period='7d', max_results=5)
+    news = google_news.get_news(ticker)
+    if news:
+        return news[0]  # Return the latest news
+    return None
+
+
+# Analyze sentiment
+def analyze_sentiment(text):
+    blob = TextBlob(text)
+    sentiment = blob.sentiment.polarity
+    if sentiment > 0.1:
+        return "Positive", "The stock may increase based on this news."
+    elif sentiment < -0.1:
+        return "Negative", "The stock may decrease based on this news."
+    else:
+        return "Neutral", "The stock may not be significantly affected by this news."
+
+
 app = dash.Dash(__name__)
 
-# Load initial data
-initial_ticker = 'AAPL'
-df = load_data(initial_ticker)
-future_days, predictions, mae, mse, accuracy = forecast_with_accuracy(df)
-
 # List of stock tickers for the dropdown
-stock_tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
+stock_tickers = [
+    {'label': 'Apple Inc. (AAPL)', 'value': 'AAPL'},
+    {'label': 'Microsoft Corporation (MSFT)', 'value': 'MSFT'},
+    {'label': 'Alphabet Inc. (GOOGL)', 'value': 'GOOGL'},
+    {'label': 'Amazon.com, Inc. (AMZN)', 'value': 'AMZN'},
+    {'label': 'Tesla, Inc. (TSLA)', 'value': 'TSLA'},
+    {'label': 'JPMorgan Chase & Co. (JPM)', 'value': 'JPM'},
+    {'label': 'Johnson & Johnson (JNJ)', 'value': 'JNJ'},
+    {'label': 'Visa Inc. (V)', 'value': 'V'},
+    {'label': 'Procter & Gamble Company (PG)', 'value': 'PG'},
+    {'label': 'Walmart Inc. (WMT)', 'value': 'WMT'},
+]
 
-# App layout
+initial_ticker = 'AAPL'
+
 app.layout = html.Div([
     html.H1("Stock Price Visualization and Forecasting"),
     dcc.Dropdown(
         id='ticker-dropdown',
-        options=[{'label': ticker, 'value': ticker} for ticker in stock_tickers],
+        options=stock_tickers,
         value=initial_ticker,
         clearable=False
     ),
+    html.Div(id='stock-description', style={'whiteSpace': 'pre-wrap'}),
     dcc.Graph(id='stock-graph'),
-    html.Div(id='accuracy-metrics'),
+    html.Div(id='accuracy-display'),
+    html.H2("Latest News"),
+    html.Div(id='news-content'),
+    html.Div(id='sentiment-alert'),
+    dcc.Graph(id='sentiment-graph'),
     dcc.Interval(
         id='interval-component',
         interval=60 * 60 * 1000,  # Refresh every hour
@@ -125,31 +153,24 @@ app.layout = html.Div([
 ])
 
 
-# Callback to update graph and metrics
 @app.callback(
     [Output('stock-graph', 'figure'),
-     Output('accuracy-metrics', 'children')],
+     Output('accuracy-display', 'children'),
+     Output('stock-description', 'children'),
+     Output('news-content', 'children'),
+     Output('sentiment-alert', 'children'),
+     Output('sentiment-graph', 'figure')],
     [Input('ticker-dropdown', 'value'),
      Input('interval-component', 'n_intervals')]
 )
-def update_graph(ticker, n_intervals):
+def update_dashboard(ticker, n_intervals):
     df = load_data(ticker)
-    future_days, predictions, mae, mse, accuracy = forecast_with_accuracy(df)
+    future_days, predictions, accuracy = forecast(df)
 
     figure = {
         'data': [
-            go.Scatter(
-                x=df['Date'],
-                y=df['Close'],
-                mode='lines',
-                name='Historical'
-            ),
-            go.Scatter(
-                x=future_days,
-                y=predictions,
-                mode='lines',
-                name='Forecast'
-            )
+            go.Scatter(x=df['Date'], y=df['Close'], mode='lines', name='Historical'),
+            go.Scatter(x=future_days, y=predictions.flatten(), mode='lines', name='Forecast')
         ],
         'layout': go.Layout(
             title=f'Stock Prices for {ticker}',
@@ -158,16 +179,36 @@ def update_graph(ticker, n_intervals):
         )
     }
 
-    accuracy_metrics = html.Div([
-        html.H3("Model Performance Metrics"),
-        html.P(f"Mean Absolute Error: ${mae:.2f}"),
-        html.P(f"Root Mean Squared Error: ${np.sqrt(mse):.2f}"),
-        html.P(f"Accuracy (within 5% of actual): {accuracy * 100:.2f}%")
-    ])
+    accuracy_text = f"Model Accuracy: {accuracy:.2%}"
+    description = get_stock_description(ticker)
 
-    return figure, accuracy_metrics
+    news = get_latest_news(ticker)
+    if news:
+        news_content = html.Div([
+            html.H3(news['title']),
+            html.P(news['description']),
+            html.A("Read more", href=news['url'], target="_blank")
+        ])
+        sentiment, alert_message = analyze_sentiment(news['title'] + " " + news['description'])
+        sentiment_alert = html.Div(f"Sentiment: {sentiment}. {alert_message}",
+                                   style={
+                                       'color': 'green' if sentiment == 'Positive' else 'red' if sentiment == 'Negative' else 'black'})
+
+        sentiment_figure = {
+            'data': [
+                go.Bar(x=['Sentiment'], y=[TextBlob(news['title'] + " " + news['description']).sentiment.polarity])],
+            'layout': go.Layout(
+                title='News Sentiment',
+                yaxis={'title': 'Sentiment Score', 'range': [-1, 1]}
+            )
+        }
+    else:
+        news_content = html.P("No recent news available.")
+        sentiment_alert = html.P("No sentiment analysis available.")
+        sentiment_figure = {}
+
+    return figure, accuracy_text, description, news_content, sentiment_alert, sentiment_figure
 
 
-# Run the app
 if __name__ == '__main__':
     app.run_server(debug=True)
